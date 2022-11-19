@@ -108,6 +108,11 @@ static void cache_insert(const char* title_id, const char* title_name){
 	title_info_cache[cache_last].name = strdup(title_name);
 	cache_last++;
 	cache_last = cache_last % MAX_TITLE_INFO_CACHE_SIZE;
+	if (cache_first == cache_last)
+	{
+		cache_first++;
+		cache_first = cache_first % MAX_TITLE_INFO_CACHE_SIZE;
+	}
 }
 
 
@@ -121,9 +126,10 @@ void title_id_make_index()
 		return;
 
 	fr = f_open(&fil, "titleid_name.txt", FA_READ);
-	if(FR_OK != fr)
+	if(FR_OK != fr){
 		f_close(&out_fil);
 		return;
+	}
 
 	
 
