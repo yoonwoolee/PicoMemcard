@@ -5,6 +5,8 @@
 #include "sd_config.h"
 #include "memory_card.h"
 
+#define LAST_MEMCARD_FILENAME "last_memcard.txt"
+
 bool is_name_valid(uint8_t* filename) {
 	if(!filename)
 		return false;
@@ -60,6 +62,8 @@ uint32_t memcard_manager_count() {
 	return count;
 }
 
+
+
 uint32_t memcard_manager_get(uint32_t index, uint8_t* out_filename) {
 	if(!out_filename)
 		return MM_BAD_PARAM;
@@ -92,6 +96,72 @@ uint32_t memcard_manager_get(uint32_t index, uint8_t* out_filename) {
 	/* sort names alphabetically */
 	qsort(image_names, count, (MAX_MC_FILENAME_LEN + 1), (__compar_fn_t) strcmp);
 	strcpy(out_filename, &image_names[(MAX_MC_FILENAME_LEN + 1) * index]);
+	free(image_names);	// free allocated memory
+	return MM_OK;
+}
+
+static const char* read_last_memcard()
+{
+	static char last_memcard[16] = "";
+	FIL fil;
+	FRESULT f_res = f_open(&fil, LAST_MEMCARD_FILENAME, FA_READ);
+	if(f_res != FR_OK) {
+		return "";
+	}
+	last_memcard[0] = '\0';
+	f_gets(last_memcard,16,&fil);
+	f_close(&fil);
+
+	int len = strlen(last_memcard);
+	if (len <= 0 || len >=16 )
+		return "";
+
+	if (last_memcard[len - 1] == '\n')
+		last_memcard[len - 1] = '\0';
+	return last_memcard;
+}
+
+uint32_t memcard_manager_get_last(uint8_t* out_filename) {
+	if(!out_filename)
+		return MM_BAD_PARAM;
+	uint32_t count = memcard_manager_count();
+	uint8_t* image_names = malloc(((MAX_MC_FILENAME_LEN + 1) * count));	// allocate space for image names
+	if(!image_names)
+		return MM_ALLOC_FAIL; // malloc failed
+	/* retrive images names */
+	FRESULT res;
+	DIR root;
+	FILINFO f_info;
+	res = f_opendir(&root, "");	// open root directory
+	uint32_t i = 0;
+	if(res == FR_OK) {
+		while(true) {
+			res = f_readdir(&root, &f_info);
+			if(res != FR_OK || f_info.fname[0] == 0) break;
+			if(!(f_info.fattrib & AM_DIR)) {	// not a directory
+				if(is_image_valid(f_info.fname)) {
+					strcpy(&image_names[(MAX_MC_FILENAME_LEN + 1) * i], f_info.fname);
+					++i;
+				}
+			}
+		}
+	}
+	qsort(image_names, count, (MAX_MC_FILENAME_LEN + 1), (__compar_fn_t) strcmp);
+	strcpy(out_filename, &image_names[(MAX_MC_FILENAME_LEN + 1) * 0]);
+	const char* last = read_last_memcard();
+
+	if (strcmp(last, "") != 0)
+	{
+		for( int ii=0;ii<i ;ii++)
+		{
+			if (strcmp(&image_names[(MAX_MC_FILENAME_LEN + 1) * ii], last)==0)
+			{
+				strcpy(out_filename, last);
+				break;
+			}
+		}
+	}
+
 	free(image_names);	// free allocated memory
 	return MM_OK;
 }
@@ -306,3 +376,15 @@ uint32_t memcard_manager_create(uint8_t* out_filename) {
 	}
 	return MM_OK;
 }
+
+void memcard_manager_write_last_memcard(const char* lastmemcard)
+{
+	FIL fil;
+	FRESULT f_res = f_open(&fil, LAST_MEMCARD_FILENAME, FA_CREATE_ALWAYS | FA_WRITE);
+	if(f_res != FR_OK)
+		return;
+	int file_wrotenum = 0;
+	f_write(&fil, lastmemcard, strlen(lastmemcard), &file_wrotenum);
+	f_close(&fil);
+}
+

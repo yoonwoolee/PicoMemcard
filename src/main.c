@@ -16,7 +16,7 @@
 
 
 bool tud_mount_status = false;
-
+int lcd_init_main();
 void cdc_task(void);
 
 /*------------- MAIN -------------*/
@@ -27,6 +27,7 @@ int main(void) {
 	/* Pico connected to PC, initialize USB transfer mode */
 	board_init();
 	tusb_init();
+	lcd_init_main();
 
 	while(true) {
 		tud_task(); // tinyusb device task

@@ -13,6 +13,8 @@
 #include "config.h"
 #include "pad.h"
 #include "led.h"
+#include "title_id.h"
+#include "lcd.h"
 
 #define MEMCARD_TOP 0x81
 #define MEMCARD_READ 0x52
@@ -36,6 +38,9 @@ memory_card_t mc;
 bool request_next_mc = false;
 bool request_prev_mc = false;
 bool request_new_mc = false;
+bool request_display_left = false;
+bool request_display_right = false;
+int display_memory_block_index = -1;
 mutex_t mutex_sm_tick;
 queue_t mc_sector_sync_queue;
 
@@ -177,6 +182,12 @@ void state_machine_tick(uint8_t data) {
 							break;
 						case START & SELECT & TRIANGLE:
 							request_new_mc = true;
+							break;
+						case START & SELECT & LEFT:
+							request_display_left = true;
+							break;
+						case START & SELECT & RIGHT:
+							request_display_right = true;
 							break;
 					}
 					break;
@@ -350,6 +361,67 @@ bool is_mc_switch_safe() {
 	return (current_state != MC_EXECUTE_WRITE && next_state != MC_EXECUTE_WRITE && queue_is_empty(&mc_sector_sync_queue));
 }
 
+void display_mc_info(memory_card_t* mc, const char* file_name){
+
+	uint8_t b_info[16] = {0,};
+
+	for (int i=0; i<15; i++)
+	{
+		uint8_t* current_header = memory_card_get_sector_ptr(mc, 1 + i);
+		if ( current_header[0] == 0x51)
+		{
+			uint8_t countrycode_first = current_header[0x0A];
+			uint8_t countrycode_last = current_header[0x0B];
+			if (countrycode_first == 'B' && countrycode_last == 'I')
+			{
+				b_info[i] = 'J';
+			}else if (countrycode_first == 'B' && countrycode_last == 'A')
+			{
+				b_info[i] = 'U';
+			}else if (countrycode_first == 'B' && countrycode_last == 'E')
+			{
+				b_info[i] = 'E';
+			}else
+			{
+				b_info[i] = '[';
+			}
+		}else if (current_header[0] == 0x52)
+		{
+			b_info[i] = '-';
+		}else if (current_header[0] == 0x53)
+		{
+			b_info[i] = ']';
+		}else
+		{
+			b_info[i] = '0';
+		}
+	}
+	int use_count = 0;
+	for (int i=0;i<15;i++)
+		if (b_info[i] != '0')
+			use_count++;
+	int not_use_count = 15- use_count;
+
+	lcd_clear();
+	char buf[32];
+	sprintf(buf, "%s   %d/15", file_name, use_count);
+	lcd_string(buf);
+	lcd_set_cursor(1, 0);
+	if (not_use_count >= 10)
+	{
+		lcd_string("#");
+	}else if(not_use_count >= 4)
+	{
+		lcd_string("*");
+	}else if(not_use_count >= 1)
+	{
+		lcd_string("!");
+	}else				{
+		lcd_string("0");
+	}
+	lcd_string((char*)b_info);
+}
+
 _Noreturn int simulate_memory_card() {
 	mutex_init(&mutex_sm_tick);
 	queue_init(&mc_sector_sync_queue, sizeof(sector_t), MC_SEC_COUNT);	// enough space to do complete MC copy
@@ -361,7 +433,7 @@ _Noreturn int simulate_memory_card() {
 		while(true)
 			led_blink_error(1);
 	}
-
+	title_id_make_index();
 	uint32_t status;	
 	status = memory_card_init(&mc);
 	if(status != MC_OK) {
@@ -370,7 +442,8 @@ _Noreturn int simulate_memory_card() {
 			sleep_ms(2000);
 		}
 	}
-	status = memcard_manager_get_first(mc_file_name);	// get first memory card
+	//status = memcard_manager_get_first(mc_file_name);	// get first memory card
+	status = memcard_manager_get_last(mc_file_name);
 	if(status != MM_OK) {
 		while(true) {
 			led_blink_error(status);
@@ -384,7 +457,7 @@ _Noreturn int simulate_memory_card() {
 			sleep_ms(2000);
 		}
 	}
-
+	memcard_manager_write_last_memcard(mc_file_name);
 	printf("\n\nInitializing memory card simulation...\n");
 
 	/* Setup PIO interrupts */
@@ -414,6 +487,9 @@ _Noreturn int simulate_memory_card() {
 	/* Launch memory card thread */
 	multicore_launch_core1(simulation_thread);
 
+	display_mc_info(&mc, mc_file_name);
+
+	absolute_time_t before_time= get_absolute_time();
 	while(true) {
 		if(!queue_is_empty(&mc_sector_sync_queue)) {
 			led_output_sync_status(true);
@@ -425,6 +501,7 @@ _Noreturn int simulate_memory_card() {
 		} else {
 			led_output_sync_status(false);
 		}
+
 		if(request_next_mc || request_prev_mc) {
 			if(request_next_mc && request_prev_mc) {
 				/* requested change in both directions, do nothing */
@@ -448,12 +525,22 @@ _Noreturn int simulate_memory_card() {
 							strcpy(mc_file_name, new_file_name);
 							status = memory_card_import(&mc, mc_file_name);
 							if(status != MC_OK)
+							{
 								led_blink_error(status);
+							}
+							display_memory_block_index=-1;
 							simulate_mc_reconnect();
 							request_next_mc = false;
 							request_prev_mc = false;
 						}
 						mutex_exit(&mutex_sm_tick);
+						if(status == MC_OK)
+						{
+							mutex_enter_blocking(&mutex_sm_tick);
+							memcard_manager_write_last_memcard(mc_file_name);
+							mutex_exit(&mutex_sm_tick);
+							display_mc_info(&mc, mc_file_name);
+						}
 					}
 				}
 			}
@@ -468,14 +555,91 @@ _Noreturn int simulate_memory_card() {
 						strcpy(mc_file_name, new_name);
 						status = memory_card_import(&mc, mc_file_name);	// switch to newly created mc image
 						if(status != MC_OK)
+						{
 							led_blink_error(status);
+						}
 					} else
 						led_blink_error(status);
 					simulate_mc_reconnect();
 					request_new_mc = false;
 				}
 				mutex_exit(&mutex_sm_tick);
+
+				if(status == MC_OK){
+					display_mc_info(&mc, mc_file_name);
+					mutex_enter_blocking(&mutex_sm_tick);
+					memcard_manager_write_last_memcard(mc_file_name);
+					mutex_exit(&mutex_sm_tick);
+				}
 			}
+		}else if(request_display_left || request_display_right) {
+			absolute_time_t current_time = get_absolute_time();
+			if (absolute_time_diff_us(before_time, current_time) < 300000)
+			{
+				request_display_left = false;
+				request_display_right = false;
+				continue;
+			}
+			before_time = current_time;
+			if (request_display_left)
+			{
+				if (display_memory_block_index <= 0)
+					display_memory_block_index = 14;
+				else
+					display_memory_block_index--;
+			}else
+			{
+				if (display_memory_block_index >= 14)
+					display_memory_block_index = 0;
+				else
+					display_memory_block_index++;
+			}
+
+			char str_display_memory_block_index[3] = "";
+
+			if (display_memory_block_index < 9){
+				str_display_memory_block_index[0] = ' ';
+				itoa(display_memory_block_index + 1, str_display_memory_block_index + 1,10);
+			}else{
+				itoa(display_memory_block_index + 1, str_display_memory_block_index,10);
+			}
+			str_display_memory_block_index[2] = '\0';
+
+			lcd_set_cursor(0, 14);
+			lcd_string(str_display_memory_block_index);
+			uint8_t* current_header = memory_card_get_sector_ptr(&mc, 1 + display_memory_block_index);
+			if (current_header)
+			{
+				lcd_set_cursor(1, 0);
+
+				if (current_header[0] == 0x51)
+				{
+					char title_id[16] = "";
+					char title_name_16[20] = "";
+					strncpy(title_id, &(current_header[0x0C]), 10);
+					title_id[10] = '\0';
+					mutex_enter_blocking(&mutex_sm_tick);
+					const char* title_name = title_id_find_name(title_id);
+					mutex_exit(&mutex_sm_tick);
+					if (title_name)
+					{
+						strncpy(title_name_16, title_name, 16);
+						title_name_16[17] = '\0';
+						lcd_string(title_name_16);
+					}else
+					{
+						lcd_string(title_id);
+					}
+				}else if(current_header[0] == 0x52){
+					lcd_string("--->            ");
+				}else if(current_header[0] == 0x53){
+					lcd_string("----]           ");
+				}else{
+					lcd_string("                ");
+				}
+			}
+			request_display_left = false;
+			request_display_right = false;
 		}
 	}
 }

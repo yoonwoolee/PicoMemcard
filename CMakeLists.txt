@@ -26,6 +26,8 @@ target_sources(PicoMemcard PUBLIC
     ${CMAKE_SOURCE_DIR}/src/msc_handler.c
     ${CMAKE_SOURCE_DIR}/src/sd_config.c
     ${CMAKE_SOURCE_DIR}/src/usb_descriptors.c
+    ${CMAKE_SOURCE_DIR}/src/lcd_1602_i2c.c
+    ${CMAKE_SOURCE_DIR}/src/title_id.c
 )
 
 # Example include
@@ -35,6 +37,6 @@ target_include_directories(PicoMemcard PUBLIC
 
 pico_enable_stdio_uart(PicoMemcard 1)	# enable only UART stdio
 
-target_link_libraries(PicoMemcard pico_stdlib pico_multicore pico_time hardware_pio tinyusb_device tinyusb_board FatFs_SPI)
+target_link_libraries(PicoMemcard pico_stdlib pico_multicore pico_time hardware_pio tinyusb_device tinyusb_board FatFs_SPI hardware_i2c)
 
 pico_add_extra_outputs(PicoMemcard)

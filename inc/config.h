@@ -10,8 +10,8 @@
 #define MC_RECONNECT_TIME	1000				// time (in ms) the memory card stays disconnected when simulating reconnection
 
 /* Board targeted by build */
-#define PICO
-//#define RP2040ZERO
+//#define PICO
+#define RP2040ZERO
 
 /* PSX Interface Pinout */
 #ifdef PICO
