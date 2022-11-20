@@ -35,14 +35,25 @@ uint offsetDatWriter;
 uint offsetDatReader;
 
 memory_card_t mc;
+
 bool request_next_mc = false;
 bool request_prev_mc = false;
 bool request_new_mc = false;
 bool request_display_left = false;
 bool request_display_right = false;
 int display_memory_block_index = -1;
-mutex_t mutex_sm_tick;
+
+uint8_t mc_file_name[MAX_MC_FILENAME_LEN + 1];	// +1 for null terminator character
+uint8_t new_file_name[MAX_MC_FILENAME_LEN + 1]; // +1 for null terminator character
+
 queue_t mc_sector_sync_queue;
+queue_t cmd_queue1;
+queue_t cmd_queue2;
+
+enum CMD{
+	CMD_DO_REPLACE_MC,
+	CMD_FINISH_REPLACE_MC,
+};
 
 enum states {
 	MC_IDLE,
@@ -348,17 +359,57 @@ void state_machine_tick(uint8_t data) {
 }
 
 _Noreturn void simulation_thread() {
+	printf("\n\nInitializing memory card simulation...\n");
+
+	/* Setup PIO interrupts */
+	irq_set_exclusive_handler(PIO0_IRQ_0, pio0_irq0); // installed on the current core (0)
+	irq_set_enabled(PIO0_IRQ_0, true);
+
+	offsetSelMonitor = pio_add_program(pio0, &sel_monitor_program);
+	offsetCmdReader = pio_add_program(pio0, &cmd_reader_program);
+	offsetDatReader = pio_add_program(pio0, &dat_reader_program);
+	offsetDatWriter = pio_add_program(pio0, &dat_writer_program);
+
+	smSelMonitor = pio_claim_unused_sm(pio0, true);
+	smCmdReader = pio_claim_unused_sm(pio0, true);
+	smDatReader = pio_claim_unused_sm(pio0, true);
+	smDatWriter = pio_claim_unused_sm(pio0, true);
+
+	dat_writer_program_init(pio0, smDatWriter, offsetDatWriter, PIN_DAT, PIN_SEL);
+	cmd_reader_program_init(pio0, smCmdReader, offsetCmdReader, PIN_CMD, PIN_ACK);
+	dat_reader_program_init(pio0, smDatReader, offsetDatReader, PIN_DAT);
+	sel_monitor_program_init(pio0, smSelMonitor, offsetSelMonitor, PIN_SEL);
+
+
+	/* Enable all SM simultaneously */
+	uint32_t smMask = (1 << smSelMonitor) | (1 << smCmdReader) | (1 << smDatReader) | (1 << smDatWriter);
+	pio_enable_sm_mask_in_sync(pio0, smMask);
+
 	printf("Simulation core begin...\n");
+	enum CMD get_cmd;
 	while(true) {
-		mutex_enter_blocking(&mutex_sm_tick);
 		uint8_t item = read_byte_blocking(pio0, smCmdReader);
 		state_machine_tick(item);
-		mutex_exit(&mutex_sm_tick);
-	}
-}
 
-bool is_mc_switch_safe() {
-	return (current_state != MC_EXECUTE_WRITE && next_state != MC_EXECUTE_WRITE && queue_is_empty(&mc_sector_sync_queue));
+		if (queue_try_remove(&cmd_queue1,&get_cmd))
+		{
+			if (get_cmd == CMD_DO_REPLACE_MC)
+			{
+				uint32_t status = memory_card_import(&mc, new_file_name);
+				if(status != MC_OK)
+				{
+					memory_card_import(&mc, mc_file_name);
+				}else
+				{
+					strcpy(mc_file_name, new_file_name);
+				}
+				memcard_manager_write_last_memcard(mc_file_name);
+				simulate_mc_reconnect();
+				enum CMD cmd = CMD_FINISH_REPLACE_MC;
+				queue_add_blocking(&cmd_queue2, &cmd);
+			}
+		}
+	}
 }
 
 void display_mc_info(memory_card_t* mc, const char* file_name){
@@ -423,9 +474,10 @@ void display_mc_info(memory_card_t* mc, const char* file_name){
 }
 
 _Noreturn int simulate_memory_card() {
-	mutex_init(&mutex_sm_tick);
 	queue_init(&mc_sector_sync_queue, sizeof(sector_t), MC_SEC_COUNT);	// enough space to do complete MC copy
-	uint8_t mc_file_name[MAX_MC_FILENAME_LEN + 1];	// +1 for null terminator character
+	queue_init(&cmd_queue1, sizeof(enum CMD), 2);	//
+	queue_init(&cmd_queue2, sizeof(enum CMD), 2);	//
+
 
 	/* Mount and test SD card filesystem */
 	sd_card_t *p_sd = sd_get_by_num(0);
@@ -434,6 +486,7 @@ _Noreturn int simulate_memory_card() {
 			led_blink_error(1);
 	}
 	title_id_make_index();
+
 	uint32_t status;	
 	status = memory_card_init(&mc);
 	if(status != MC_OK) {
@@ -442,7 +495,7 @@ _Noreturn int simulate_memory_card() {
 			sleep_ms(2000);
 		}
 	}
-	//status = memcard_manager_get_first(mc_file_name);	// get first memory card
+
 	status = memcard_manager_get_last(mc_file_name);
 	if(status != MM_OK) {
 		while(true) {
@@ -457,39 +510,13 @@ _Noreturn int simulate_memory_card() {
 			sleep_ms(2000);
 		}
 	}
-	memcard_manager_write_last_memcard(mc_file_name);
-	printf("\n\nInitializing memory card simulation...\n");
-
-	/* Setup PIO interrupts */
-	irq_set_exclusive_handler(PIO0_IRQ_0, pio0_irq0); // installed on the current core (0)
-	irq_set_enabled(PIO0_IRQ_0, true);
-
-	offsetSelMonitor = pio_add_program(pio0, &sel_monitor_program);
-	offsetCmdReader = pio_add_program(pio0, &cmd_reader_program);
-	offsetDatReader = pio_add_program(pio0, &dat_reader_program);
-	offsetDatWriter = pio_add_program(pio0, &dat_writer_program);
-
-	smSelMonitor = pio_claim_unused_sm(pio0, true);
-	smCmdReader = pio_claim_unused_sm(pio0, true);
-	smDatReader = pio_claim_unused_sm(pio0, true);
-	smDatWriter = pio_claim_unused_sm(pio0, true);
-
-	dat_writer_program_init(pio0, smDatWriter, offsetDatWriter, PIN_DAT, PIN_SEL);
-	cmd_reader_program_init(pio0, smCmdReader, offsetCmdReader, PIN_CMD, PIN_ACK);
-	dat_reader_program_init(pio0, smDatReader, offsetDatReader, PIN_DAT);
-	sel_monitor_program_init(pio0, smSelMonitor, offsetSelMonitor, PIN_SEL);
-
-
-	/* Enable all SM simultaneously */
-	uint32_t smMask = (1 << smSelMonitor) | (1 << smCmdReader) | (1 << smDatReader) | (1 << smDatWriter);
-	pio_enable_sm_mask_in_sync(pio0, smMask);
 
 	/* Launch memory card thread */
 	multicore_launch_core1(simulation_thread);
 
 	display_mc_info(&mc, mc_file_name);
-
 	absolute_time_t before_time= get_absolute_time();
+
 	while(true) {
 		if(!queue_is_empty(&mc_sector_sync_queue)) {
 			led_output_sync_status(true);
@@ -502,77 +529,76 @@ _Noreturn int simulate_memory_card() {
 			led_output_sync_status(false);
 		}
 
+		if(!queue_is_empty(&cmd_queue2)) {
+			enum CMD cmd;
+			queue_remove_blocking(&cmd_queue2, &cmd);
+			display_mc_info(&mc, mc_file_name);
+			display_memory_block_index = -1;
+		}
+
 		if(request_next_mc || request_prev_mc) {
 			if(request_next_mc && request_prev_mc) {
 				/* requested change in both directions, do nothing */
 				request_next_mc = false;
 				request_prev_mc = false;
-			} else {
-				uint32_t status;
-				uint8_t new_file_name[MAX_MC_FILENAME_LEN + 1];
-				if(request_next_mc)
-					status = memcard_manager_get_next(mc_file_name, new_file_name);
-				else if (request_prev_mc)
-					status = memcard_manager_get_prev(mc_file_name, new_file_name);
-				if(status != MM_OK) {
-					led_output_end_mc_list();
-					request_next_mc = false;
-					request_prev_mc = false;
-				} else {
-					if(is_mc_switch_safe()) {	// check that switch is safe before getting the lock
-						mutex_enter_blocking(&mutex_sm_tick);
-						if(is_mc_switch_safe) {	// and also after
-							strcpy(mc_file_name, new_file_name);
-							status = memory_card_import(&mc, mc_file_name);
-							if(status != MC_OK)
-							{
-								led_blink_error(status);
-							}
-							display_memory_block_index=-1;
-							simulate_mc_reconnect();
-							request_next_mc = false;
-							request_prev_mc = false;
-						}
-						mutex_exit(&mutex_sm_tick);
-						if(status == MC_OK)
-						{
-							mutex_enter_blocking(&mutex_sm_tick);
-							memcard_manager_write_last_memcard(mc_file_name);
-							mutex_exit(&mutex_sm_tick);
-							display_mc_info(&mc, mc_file_name);
-						}
-					}
-				}
+				continue;
 			}
-		} else if(request_new_mc) {
-			if(is_mc_switch_safe()) {	// check that switch is safe before getting the lock
-				mutex_enter_blocking(&mutex_sm_tick);
-				if(is_mc_switch_safe) {	// and also after
-					uint8_t new_name[MAX_MC_FILENAME_LEN + 1];
-					status = memcard_manager_create(new_name);
-					if(status == MM_OK) {
-						led_output_new_mc();
-						strcpy(mc_file_name, new_name);
-						status = memory_card_import(&mc, mc_file_name);	// switch to newly created mc image
-						if(status != MC_OK)
-						{
-							led_blink_error(status);
-						}
-					} else
-						led_blink_error(status);
-					simulate_mc_reconnect();
-					request_new_mc = false;
-				}
-				mutex_exit(&mutex_sm_tick);
+			if (request_next_mc)
+				status = memcard_manager_get_next(mc_file_name, new_file_name);
+			else if(request_prev_mc)
+				status = memcard_manager_get_prev(mc_file_name, new_file_name);
 
-				if(status == MC_OK){
-					display_mc_info(&mc, mc_file_name);
-					mutex_enter_blocking(&mutex_sm_tick);
-					memcard_manager_write_last_memcard(mc_file_name);
-					mutex_exit(&mutex_sm_tick);
-				}
+			if (status != MC_OK)
+			{
+				led_blink_error(status);
+				request_next_mc = false;
+				request_prev_mc = false;
+				continue;
 			}
-		}else if(request_display_left || request_display_right) {
+			status = memory_card_check(new_file_name);
+			if (status != MC_OK)
+			{
+				led_blink_error(status);
+				request_next_mc = false;
+				request_prev_mc = false;
+				continue;
+			}
+			enum CMD cmd = CMD_DO_REPLACE_MC;
+			queue_add_blocking(&cmd_queue1,&cmd);
+			while (!queue_is_empty(&cmd_queue1))
+			{
+				sleep_ms(10);
+			}
+			request_next_mc = false;
+			request_prev_mc = false;
+
+		}
+
+		if(request_new_mc) {
+			status = memcard_manager_create(new_file_name);
+			if(status != MM_OK) {
+				led_blink_error(status);
+				continue;
+			}
+
+			status = memory_card_check(new_file_name);
+			if (status != MC_OK)
+			{
+				led_blink_error(status);
+				continue;
+			}
+
+			led_output_new_mc();
+			enum CMD cmd = CMD_DO_REPLACE_MC;
+			queue_add_blocking(&cmd_queue1, &cmd);
+			while (!queue_is_empty(&cmd_queue1))
+			{
+				sleep_ms(10);
+			}
+			request_new_mc = false;
+		}
+
+		if(request_display_left || request_display_right) {
 			absolute_time_t current_time = get_absolute_time();
 			if (absolute_time_diff_us(before_time, current_time) < 300000)
 			{
@@ -618,9 +644,8 @@ _Noreturn int simulate_memory_card() {
 					char title_name_16[20] = "";
 					strncpy(title_id, &(current_header[0x0C]), 10);
 					title_id[10] = '\0';
-					mutex_enter_blocking(&mutex_sm_tick);
 					const char* title_name = title_id_find_name(title_id);
-					mutex_exit(&mutex_sm_tick);
+
 					if (title_name)
 					{
 						strncpy(title_name_16, title_name, 16);

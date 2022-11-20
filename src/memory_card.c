@@ -14,6 +14,22 @@ uint32_t memory_card_init(memory_card_t* mc) {
 	return MC_OK;
 }
 
+uint32_t memory_card_check(uint8_t* file_name) {
+
+	uint32_t status = MC_OK;
+	FIL memcard;
+	if (FR_OK == f_open(&memcard, file_name, FA_READ))
+	{
+		if (f_size(&memcard) != MC_SIZE)
+		{
+			status = MC_FILE_SIZE_ERR;
+		}
+	}else{
+		return MC_FILE_OPEN_ERR;
+	}
+	f_close(&memcard);
+	return status;
+}
 uint32_t memory_card_import(memory_card_t* mc, uint8_t* file_name) {
 	uint32_t status = MC_OK;
 	FIL memcard;
