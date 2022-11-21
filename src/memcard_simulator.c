@@ -36,19 +36,21 @@ uint offsetDatReader;
 
 memory_card_t mc;
 
-bool request_next_mc = false;
-bool request_prev_mc = false;
-bool request_new_mc = false;
-bool request_display_left = false;
-bool request_display_right = false;
-int display_memory_block_index = -1;
-
 uint8_t mc_file_name[MAX_MC_FILENAME_LEN + 1];	// +1 for null terminator character
 uint8_t new_file_name[MAX_MC_FILENAME_LEN + 1]; // +1 for null terminator character
 
 queue_t mc_sector_sync_queue;
-queue_t cmd_queue1;
-queue_t cmd_queue2;
+queue_t cmd_queue;
+queue_t request_key_queue;
+
+enum REQ{
+	REQ_NONE,
+	REQ_REPLACE_NEXT_MC,
+	REQ_REPLACE_PREV_MC,
+	REQ_REPLACE_NEW_MC,
+	REQ_DISPLAY_NEXT_BLOCK,
+	REQ_DISPLAY_PREV_BLOCK,
+};
 
 enum CMD{
 	CMD_DO_REPLACE_MC,
@@ -136,6 +138,7 @@ void cancel_ack() {
 }
 
 void state_machine_tick(uint8_t data) {
+	enum REQ req= REQ_NONE;
 	bool valid_command = false;
 	current_state = next_state;
 
@@ -186,19 +189,24 @@ void state_machine_tick(uint8_t data) {
 					sw_status = sw_status | (read_byte_blocking(pio0, smDatReader) << 8);
 					switch(sw_status) {
 						case START & SELECT & UP:
-							request_next_mc = true;
+							req = REQ_REPLACE_NEXT_MC;
+							queue_try_add(&request_key_queue, &req);
 							break;
 						case START & SELECT & DOWN:
-							request_prev_mc = true;
+							req = REQ_REPLACE_PREV_MC;
+							queue_try_add(&request_key_queue, &req);
 							break;
 						case START & SELECT & TRIANGLE:
-							request_new_mc = true;
+							req = REQ_REPLACE_NEW_MC;
+							queue_try_add(&request_key_queue, &req);
 							break;
 						case START & SELECT & LEFT:
-							request_display_left = true;
+							req = REQ_DISPLAY_PREV_BLOCK;
+							queue_try_add(&request_key_queue, &req);
 							break;
 						case START & SELECT & RIGHT:
-							request_display_right = true;
+							req = REQ_DISPLAY_NEXT_BLOCK;
+							queue_try_add(&request_key_queue, &req);
 							break;
 					}
 					break;
@@ -391,7 +399,7 @@ _Noreturn void simulation_thread() {
 		uint8_t item = read_byte_blocking(pio0, smCmdReader);
 		state_machine_tick(item);
 
-		if (queue_try_remove(&cmd_queue1,&get_cmd))
+		if (queue_try_peek(&cmd_queue, &get_cmd))
 		{
 			if (get_cmd == CMD_DO_REPLACE_MC)
 			{
@@ -405,9 +413,8 @@ _Noreturn void simulation_thread() {
 				}
 				memcard_manager_write_last_memcard(mc_file_name);
 				simulate_mc_reconnect();
-				enum CMD cmd = CMD_FINISH_REPLACE_MC;
-				queue_add_blocking(&cmd_queue2, &cmd);
 			}
+			queue_remove_blocking(&cmd_queue, &get_cmd);
 		}
 	}
 }
@@ -475,9 +482,8 @@ void display_mc_info(memory_card_t* mc, const char* file_name){
 
 _Noreturn int simulate_memory_card() {
 	queue_init(&mc_sector_sync_queue, sizeof(sector_t), MC_SEC_COUNT);	// enough space to do complete MC copy
-	queue_init(&cmd_queue1, sizeof(enum CMD), 2);	//
-	queue_init(&cmd_queue2, sizeof(enum CMD), 2);	//
-
+	queue_init(&cmd_queue, sizeof(enum CMD), 1);
+	queue_init(&request_key_queue, sizeof(enum REQ), 1);
 
 	/* Mount and test SD card filesystem */
 	sd_card_t *p_sd = sd_get_by_num(0);
@@ -510,13 +516,13 @@ _Noreturn int simulate_memory_card() {
 			sleep_ms(2000);
 		}
 	}
+	display_mc_info(&mc, mc_file_name);
 
 	/* Launch memory card thread */
 	multicore_launch_core1(simulation_thread);
 
-	display_mc_info(&mc, mc_file_name);
+	int display_memory_block_index = -1;
 	absolute_time_t before_time= get_absolute_time();
-
 	while(true) {
 		if(!queue_is_empty(&mc_sector_sync_queue)) {
 			led_output_sync_status(true);
@@ -529,142 +535,112 @@ _Noreturn int simulate_memory_card() {
 			led_output_sync_status(false);
 		}
 
-		if(!queue_is_empty(&cmd_queue2)) {
-			enum CMD cmd;
-			queue_remove_blocking(&cmd_queue2, &cmd);
-			display_mc_info(&mc, mc_file_name);
-			display_memory_block_index = -1;
-		}
-
-		if(request_next_mc || request_prev_mc) {
-			if(request_next_mc && request_prev_mc) {
-				/* requested change in both directions, do nothing */
-				request_next_mc = false;
-				request_prev_mc = false;
-				continue;
-			}
-			if (request_next_mc)
-				status = memcard_manager_get_next(mc_file_name, new_file_name);
-			else if(request_prev_mc)
-				status = memcard_manager_get_prev(mc_file_name, new_file_name);
-
-			if (status != MC_OK)
+		if (!queue_is_empty(&request_key_queue)) {
+			enum REQ req = REQ_NONE;
+			queue_remove_blocking(&request_key_queue, &req);
+			if (req == REQ_REPLACE_NEXT_MC || req == REQ_REPLACE_PREV_MC || req == REQ_REPLACE_NEW_MC)
 			{
-				led_blink_error(status);
-				request_next_mc = false;
-				request_prev_mc = false;
-				continue;
-			}
-			status = memory_card_check(new_file_name);
-			if (status != MC_OK)
-			{
-				led_blink_error(status);
-				request_next_mc = false;
-				request_prev_mc = false;
-				continue;
-			}
-			enum CMD cmd = CMD_DO_REPLACE_MC;
-			queue_add_blocking(&cmd_queue1,&cmd);
-			while (!queue_is_empty(&cmd_queue1))
-			{
-				sleep_ms(10);
-			}
-			request_next_mc = false;
-			request_prev_mc = false;
-
-		}
-
-		if(request_new_mc) {
-			status = memcard_manager_create(new_file_name);
-			if(status != MM_OK) {
-				led_blink_error(status);
-				continue;
-			}
-
-			status = memory_card_check(new_file_name);
-			if (status != MC_OK)
-			{
-				led_blink_error(status);
-				continue;
-			}
-
-			led_output_new_mc();
-			enum CMD cmd = CMD_DO_REPLACE_MC;
-			queue_add_blocking(&cmd_queue1, &cmd);
-			while (!queue_is_empty(&cmd_queue1))
-			{
-				sleep_ms(10);
-			}
-			request_new_mc = false;
-		}
-
-		if(request_display_left || request_display_right) {
-			absolute_time_t current_time = get_absolute_time();
-			if (absolute_time_diff_us(before_time, current_time) < 300000)
-			{
-				request_display_left = false;
-				request_display_right = false;
-				continue;
-			}
-			before_time = current_time;
-			if (request_display_left)
-			{
-				if (display_memory_block_index <= 0)
-					display_memory_block_index = 14;
+				if (req == REQ_REPLACE_NEXT_MC)
+					status = memcard_manager_get_next(mc_file_name, new_file_name);
+				else if (req == REQ_REPLACE_PREV_MC)
+					status = memcard_manager_get_prev(mc_file_name, new_file_name);
 				else
-					display_memory_block_index--;
-			}else
-			{
-				if (display_memory_block_index >= 14)
-					display_memory_block_index = 0;
-				else
-					display_memory_block_index++;
-			}
+					status = memcard_manager_create(new_file_name);
 
-			char str_display_memory_block_index[3] = "";
-
-			if (display_memory_block_index < 9){
-				str_display_memory_block_index[0] = ' ';
-				itoa(display_memory_block_index + 1, str_display_memory_block_index + 1,10);
-			}else{
-				itoa(display_memory_block_index + 1, str_display_memory_block_index,10);
-			}
-			str_display_memory_block_index[2] = '\0';
-
-			lcd_set_cursor(0, 14);
-			lcd_string(str_display_memory_block_index);
-			uint8_t* current_header = memory_card_get_sector_ptr(&mc, 1 + display_memory_block_index);
-			if (current_header)
-			{
-				lcd_set_cursor(1, 0);
-
-				if (current_header[0] == 0x51)
+				if (status != MM_OK)
 				{
-					char title_id[16] = "";
-					char title_name_16[20] = "";
-					strncpy(title_id, &(current_header[0x0C]), 10);
-					title_id[10] = '\0';
-					const char* title_name = title_id_find_name(title_id);
-
-					if (title_name)
-					{
-						strncpy(title_name_16, title_name, 16);
-						title_name_16[17] = '\0';
-						lcd_string(title_name_16);
-					}else
-					{
-						lcd_string(title_id);
-					}
-				}else if(current_header[0] == 0x52){
-					lcd_string("--->            ");
-				}else if(current_header[0] == 0x53){
-					lcd_string("----]           ");
-				}else{
-					lcd_string("                ");
+					led_blink_error(status);
+					continue;
 				}
+
+				status = memory_card_check(new_file_name);
+				if (status != MC_OK)
+				{
+					led_blink_error(status);
+					continue;
+				}
+
+				if (req == REQ_REPLACE_NEW_MC)
+					led_output_new_mc();
+
+				enum CMD cmd = CMD_DO_REPLACE_MC;
+				queue_add_blocking(&cmd_queue,&cmd);
+				while (!queue_is_empty(&cmd_queue)) // sync: wait when replace_mc
+				{
+					sleep_ms(10);
+				}
+
+				display_mc_info(&mc, mc_file_name);
+				display_memory_block_index = -1;
+
+			}else if (req == REQ_DISPLAY_NEXT_BLOCK || req == REQ_DISPLAY_PREV_BLOCK)
+			{
+				absolute_time_t current_time = get_absolute_time();
+				if (absolute_time_diff_us(before_time, current_time) < (250 * 1000)) //0.25s
+				{
+					continue;
+				}
+				before_time = current_time;
+				if (req == REQ_DISPLAY_PREV_BLOCK)
+				{
+					if (display_memory_block_index <= 0)
+						display_memory_block_index = 14;
+					else
+						display_memory_block_index--;
+				}else
+				{
+					if (display_memory_block_index >= 14)
+						display_memory_block_index = 0;
+					else
+						display_memory_block_index++;
+				}
+
+				char str_display_memory_block_index[3] = "";
+
+				if (display_memory_block_index < 9){
+					str_display_memory_block_index[0] = ' ';
+					itoa(display_memory_block_index + 1, str_display_memory_block_index + 1,10);
+				}else{
+					itoa(display_memory_block_index + 1, str_display_memory_block_index,10);
+				}
+				str_display_memory_block_index[2] = '\0';
+
+				lcd_set_cursor(0, 14);
+				lcd_string(str_display_memory_block_index);
+				uint8_t* current_header = memory_card_get_sector_ptr(&mc, 1 + display_memory_block_index);
+				if (current_header)
+				{
+					lcd_set_cursor(1, 0);
+
+					if (current_header[0] == 0x51)
+					{
+						char title_id[16] = "";
+						char title_name_16[20] = "";
+						strncpy(title_id, &(current_header[0x0C]), 10);
+						title_id[10] = '\0';
+						const char* title_name = title_id_find_name(title_id);
+
+						if (title_name)
+						{
+							strncpy(title_name_16, title_name, 16);
+							title_name_16[17] = '\0';
+							lcd_string(title_name_16);
+						}else
+						{
+							lcd_string(title_id);
+						}
+					}else if(current_header[0] == 0x52){
+						lcd_string("--->            ");
+					}else if(current_header[0] == 0x53){
+						lcd_string("----]           ");
+					}else{
+						lcd_string("                ");
+					}
+				}
+
 			}
-			request_display_left = false;
-			request_display_right = false;
+
 		}
+
 	}
 }
