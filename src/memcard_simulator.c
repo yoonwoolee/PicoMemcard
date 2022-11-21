@@ -537,7 +537,16 @@ _Noreturn int simulate_memory_card() {
 
 		if (!queue_is_empty(&request_key_queue)) {
 			enum REQ req = REQ_NONE;
-			queue_remove_blocking(&request_key_queue, &req);
+			queue_peek_blocking(&request_key_queue, &req);
+
+			absolute_time_t current_time = get_absolute_time();
+			if (absolute_time_diff_us(before_time, current_time) < (250 * 1000)) //0.25s
+			{
+				queue_remove_blocking(&request_key_queue, &req);
+				continue;
+			}
+			before_time = current_time;
+
 			if (req == REQ_REPLACE_NEXT_MC || req == REQ_REPLACE_PREV_MC || req == REQ_REPLACE_NEW_MC)
 			{
 				if (req == REQ_REPLACE_NEXT_MC)
@@ -550,6 +559,7 @@ _Noreturn int simulate_memory_card() {
 				if (status != MM_OK)
 				{
 					led_blink_error(status);
+					queue_remove_blocking(&request_key_queue, &req);
 					continue;
 				}
 
@@ -557,6 +567,7 @@ _Noreturn int simulate_memory_card() {
 				if (status != MC_OK)
 				{
 					led_blink_error(status);
+					queue_remove_blocking(&request_key_queue, &req);
 					continue;
 				}
 
@@ -565,22 +576,16 @@ _Noreturn int simulate_memory_card() {
 
 				enum CMD cmd = CMD_DO_REPLACE_MC;
 				queue_add_blocking(&cmd_queue,&cmd);
-				while (!queue_is_empty(&cmd_queue)) // sync: wait when replace_mc
+				while (!queue_is_empty(&cmd_queue)) // sync: wait until replace_mc
 				{
 					sleep_ms(10);
 				}
-
+				queue_remove_blocking(&request_key_queue, &req);
 				display_mc_info(&mc, mc_file_name);
 				display_memory_block_index = -1;
 
 			}else if (req == REQ_DISPLAY_NEXT_BLOCK || req == REQ_DISPLAY_PREV_BLOCK)
 			{
-				absolute_time_t current_time = get_absolute_time();
-				if (absolute_time_diff_us(before_time, current_time) < (250 * 1000)) //0.25s
-				{
-					continue;
-				}
-				before_time = current_time;
 				if (req == REQ_DISPLAY_PREV_BLOCK)
 				{
 					if (display_memory_block_index <= 0)
@@ -637,6 +642,7 @@ _Noreturn int simulate_memory_card() {
 						lcd_string("                ");
 					}
 				}
+				queue_remove_blocking(&request_key_queue, &req);
 
 			}
 
